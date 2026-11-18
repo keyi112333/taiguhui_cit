@@ -7,15 +7,17 @@
 - 会计期间写入计算底稿；
 - profit 表历史金额数值化、当期金额保留公式；
 - 申报底稿税款所属期间季度更新；
-- 利润表-当季季度文字更新；
+- 利润表-当季季度文字、本月本期数、季度月份回补与当季累计公式更新；
 - 利润表与 R55GL1005 整表写入；
 - 分录区读取与批号回写。
 """
+import calendar
 import re
 from datetime import date, datetime
 from pathlib import Path
 
 import openpyxl
+from openpyxl.utils import get_column_letter
 
 from config.config_loader import ConfigError
 from log.loggingConfig import logger
@@ -301,6 +303,222 @@ def update_quarter_label(book, sheet_name, quarter_start, quarter_end):
     target.value = text
     logger.info(f"季度利润表已更新：{sheet.title}!{target.coordinate} = {text}")
     return target.coordinate, text
+
+
+QUARTER_MONTH_HEADER = re.compile(r"本期数\s*[（(]\s*(\d{1,2})\s*月\s*[）)]")
+
+
+def _item_column(sheet, header_row, before_col):
+    """返回表头中“项目”所在列；找不到时取行次左侧一列。"""
+    for col in range(1, before_col):
+        if "项目" in _label(sheet.cell(header_row, col).value):
+            return col
+    return before_col - 1
+
+
+def _quarter_layout(sheet):
+    """定位“利润表-当季”的月份列、行次列、项目列与当季累计列。"""
+    for row in range(1, min(sheet.max_row, 30) + 1):
+        months = {}
+        row_no_col = total_col = item_col = None
+        for col in range(1, sheet.max_column + 1):
+            text = _label(sheet.cell(row, col).value)
+            match = QUARTER_MONTH_HEADER.search(text)
+            if match:
+                month = int(match.group(1))
+                if 1 <= month <= 12:
+                    months[month] = col
+            elif text in ("行次", "行号"):
+                row_no_col = col
+            elif "当季累计" in text:
+                total_col = col
+            elif text.startswith("项目"):
+                item_col = col
+        if months and row_no_col:
+            return {
+                "header_row": row,
+                "months": months,
+                "row_no_col": row_no_col,
+                "item_col": item_col or _item_column(sheet, row, row_no_col),
+                "total_col": total_col,
+            }
+    raise ConfigError(f"{sheet.title} 未找到“本期数（X月）/行次”表头")
+
+
+def _row_maps(sheet, header_row, row_no_col, item_col):
+    """按行次与项目名称建立行号索引。"""
+    by_row_no = {}
+    by_label = {}
+    for row in range(header_row + 1, sheet.max_row + 1):
+        row_no = _as_number(sheet.cell(row, row_no_col).value)
+        if row_no is not None:
+            by_row_no[int(row_no)] = row
+        label = _label(sheet.cell(row, item_col).value)
+        if label:
+            by_label[label] = row
+    return by_row_no, by_label
+
+
+def _profit_item_values(sheet):
+    """读取“利润表”本期数，按行次与项目名称建立金额索引。"""
+    header = _header_columns(sheet)
+    if header is None:
+        raise ConfigError(f"{sheet.title} 未找到“本期数/本年累计数”表头")
+    header_row, current_col, _, row_no_col = header
+    item_col = _item_column(sheet, header_row, row_no_col) if row_no_col else max(current_col - 1, 1)
+    by_row_no = {}
+    by_label = {}
+    for row in range(header_row + 1, sheet.max_row + 1):
+        number = _as_number(sheet.cell(row, current_col).value)
+        row_no = _as_number(sheet.cell(row, row_no_col).value) if row_no_col else None
+        if row_no is not None:
+            by_row_no[int(row_no)] = number
+        label = _label(sheet.cell(row, item_col).value)
+        if label:
+            by_label[label] = number
+    return by_row_no, by_label
+
+
+def _previous_month_values(previous_path, sheet_name):
+    """读取上期运行表全部有值的月份金额，返回按行次/项目名称索引的 {月份: 金额}。"""
+    if not previous_path:
+        return {}, {}
+    path = Path(previous_path)
+    if not path.is_file():
+        logger.info(f"上期运行表不存在，跳过月份回补：{path}")
+        return {}, {}
+    book = openpyxl.load_workbook(path, data_only=True)
+    try:
+        if sheet_name not in book.sheetnames:
+            logger.warning(f"上期运行表缺少工作表 {sheet_name}，季度月份数据不回补")
+            return {}, {}
+        sheet = book[sheet_name]
+        try:
+            layout = _quarter_layout(sheet)
+            by_row_no, by_label = _row_maps(
+                sheet, layout["header_row"], layout["row_no_col"], layout["item_col"]
+            )
+        except ConfigError as exc:
+            logger.warning(f"上期运行表季度数据无法读取，跳过回补：{exc}")
+            return {}, {}
+        by_row_values = {}
+        by_label_values = {}
+        for row_no, row in by_row_no.items():
+            values = {}
+            for month, col in layout["months"].items():
+                number = _as_number(sheet.cell(row, col).value)
+                if number is not None:
+                    values[month] = number
+            if values:
+                by_row_values[row_no] = values
+        for label, row in by_label.items():
+            values = {}
+            for month, col in layout["months"].items():
+                number = _as_number(sheet.cell(row, col).value)
+                if number is not None:
+                    values[month] = number
+            if values:
+                by_label_values[label] = values
+        logger.info(f"已读取上期运行表月份数据：{path}（{len(by_row_values)} 个项目）")
+        return by_row_values, by_label_values
+    finally:
+        book.close()
+
+
+def update_quarter_sheet(book, sheet_name, period_first, profit_sheet_name,
+                         previous_path=None):
+    """更新“利润表-当季”：季度文字、本月本期数、季度月份补齐与当季累计公式。
+
+    - 本月列取“利润表”本期数，按行次优先、项目名称兜底匹配；
+    - 上期运行表全部有值月份都回补，不限于当前季度；没有上期运行表时跳过；
+    - 当季累计列按当前季度重写公式，如 10-12 月为 =SUM(Mn:On)。
+    """
+    if sheet_name not in book.sheetnames:
+        raise ConfigError(f"季度利润表缺少工作表：{sheet_name}")
+    if profit_sheet_name not in book.sheetnames:
+        raise ConfigError(f"季度利润表缺少利润表工作表：{profit_sheet_name}")
+
+    start_month = 3 * ((period_first.month - 1) // 3) + 1
+    end_month = start_month + 2
+    quarter_start = date(period_first.year, start_month, 1)
+    quarter_end = date(
+        period_first.year, end_month, calendar.monthrange(period_first.year, end_month)[1]
+    )
+    label_coordinate, text = update_quarter_label(
+        book, sheet_name, quarter_start, quarter_end
+    )
+
+    sheet = book[sheet_name]
+    layout = _quarter_layout(sheet)
+    quarter_months = list(range(start_month, end_month + 1))
+    missing = [month for month in quarter_months if month not in layout["months"]]
+    if missing:
+        raise ConfigError(
+            f"{sheet.title} 缺少季度月份列：{','.join(str(month) for month in missing)}"
+        )
+    current_col = layout["months"][period_first.month]
+    by_row_no, by_label = _row_maps(
+        sheet, layout["header_row"], layout["row_no_col"], layout["item_col"]
+    )
+    source_by_row_no, source_by_label = _profit_item_values(book[profit_sheet_name])
+    previous_by_row_no, previous_by_label = _previous_month_values(
+        previous_path, sheet_name
+    )
+
+    # 先回补上期运行表全部有值月份（不限于当前季度），再用本月利润表数据覆盖本月列。
+    backfilled = 0
+    for row_no, row in by_row_no.items():
+        label = _label(sheet.cell(row, layout["item_col"]).value)
+        values = previous_by_row_no.get(row_no)
+        if values is None and label:
+            values = previous_by_label.get(label)
+        if not values:
+            continue
+        for month, number in values.items():
+            col = layout["months"].get(month)
+            if month == period_first.month or col is None:
+                continue
+            sheet.cell(row, col).value = number
+            backfilled += 1
+
+    written = 0
+    for row_no, row in by_row_no.items():
+        label = _label(sheet.cell(row, layout["item_col"]).value)
+        number = source_by_row_no.get(row_no)
+        if number is None and label:
+            number = source_by_label.get(label)
+        target = sheet.cell(row, current_col)
+        target.value = number
+        if number is not None:
+            written += 1
+
+    total_col = layout["total_col"]
+    if total_col:
+        first = get_column_letter(layout["months"][start_month])
+        last = get_column_letter(layout["months"][end_month])
+        # 只改模板原本有“当季累计”内容的行，避免给补充资料等行新增公式。
+        formula_rows = [
+            row for row in by_row_no.values()
+            if sheet.cell(row, total_col).value is not None
+        ] or list(by_row_no.values())
+        for row in formula_rows:
+            sheet.cell(row, total_col).value = f"=SUM({first}{row}:{last}{row})"
+
+    logger.info(
+        f"季度利润表已更新：{sheet.title}!{label_coordinate} = {text}；"
+        f"本月 {period_first.month} 月写入 {written} 个项目，"
+        f"回补月份 {backfilled} 个单元格"
+    )
+    return {
+        "label": label_coordinate,
+        "text": text,
+        "written": written,
+        "backfilled": backfilled,
+        "quarter_columns": (
+            get_column_letter(layout["months"][start_month]),
+            get_column_letter(layout["months"][end_month]),
+        ),
+    }
 
 
 def _header_columns(sheet, max_row=20):

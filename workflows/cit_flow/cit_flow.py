@@ -38,7 +38,7 @@ from workflows.cit_flow.workbook_update import (
     journal_rows,
     update_declaration_period,
     update_profit_table,
-    update_quarter_label,
+    update_quarter_sheet,
     write_batch_number,
 )
 
@@ -299,6 +299,7 @@ class CITFlow:
         # 页面操作尚未录制：调用占位函数，内部不执行任何 JDE 点击。
         browser = self.context.get_browser("JDE")
         page = browser.get_page() if browser else None
+        period, _ = month_bounds(configured_period(self.get("会计期间")))
         try:
             raw_path = download_income_statement(
                 page,
@@ -356,7 +357,9 @@ class CITFlow:
             update_profit_table(book, calc_sheet, period_first, previous_path, output)
             clear_batch_number(book, calc_sheet)
             update_declaration_period(book, declaration_sheet, quarter_start, quarter_end)
-            update_quarter_label(book, quarter_sheet, quarter_start, quarter_end)
+            update_quarter_sheet(
+                book, quarter_sheet, period_first, profit_sheet, previous_path
+            )
             book.calculation = CalcProperties(fullCalcOnLoad=True, forceFullCalc=True)
             save_with_openpyxl(book, output, links)
         finally:
