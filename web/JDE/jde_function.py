@@ -4,8 +4,8 @@
 JDE 页面操作：登录、R55GL1005 导出、利润表（R55GZ001）导出、日记帐分录录入。
 
 本模块复用房产税流程已验证的 JDE 登录、报表下载与分录录入实现；
-利润表导出按 R55GZ001 / TKHXLS001 的批版本处理流程实现，菜单位置与字段名
-可在「企业所得税配置」中覆盖，首次上线需按现场页面联调确认。
+利润表导出按 R55GZ001 / TKHXLS001 的批版本处理流程实现（页签按候选文字匹配，
+处理选项 Century / Fiscal Year / Period Number 按会计期间自动填写）。
 """
 
 import functools
@@ -35,9 +35,13 @@ JOB_STATUS_POLL_INTERVAL_SECONDS = 5
 
 # 利润表（Profit & Loss (Yearly)）默认参数，可由配置覆盖。
 INCOME_STATEMENT_MENU = "中国政府报表"
+# 页签在不同环境带公司前缀，按候选顺序依次匹配。
+INCOME_STATEMENT_MENU_CANDIDATES = ("中国政府报表", "广州中国政府报表", "太古汇中国政府报表")
 INCOME_STATEMENT_VERSION = "TKHXLS001"
 INCOME_STATEMENT_JOB = "R55GZ001"
-INCOME_STATEMENT_CENTURY = "20"
+# 处理选项字段：Century（年份前两位，如 2026→20）、Fiscal Year（年份后两位，如 26）、
+# Period Number（月）。
+INCOME_STATEMENT_OPTION_FIELDS = ("E3", "E4", "E28")
 
 
 # 重试
@@ -571,9 +575,10 @@ def _requery_submitted_jobs(frame, job_name, timeout=1500):
 
 def _wait_latest_job_completed(frame, timeout,
                                poll_seconds=JOB_STATUS_POLL_SECONDS,
-                               job_name=JOB_NAME):
-    """等“已提交作业”最新一行变为完成，返回该行的输出链接。"""
-    links = frame.get_by_role("link", name=OUTPUT_LINK_NAME)
+                               job_name=JOB_NAME,
+                               link_name=OUTPUT_LINK_NAME):
+    """等“已提交作业”最新一行变为完成，返回该行可下载的链接。"""
+    links = frame.get_by_role("link", name=link_name)
     deadline = time.monotonic() + timeout / 1000
     while links.count() == 0:
         if time.monotonic() >= deadline:
@@ -620,7 +625,10 @@ def _wait_latest_job_completed(frame, timeout,
 
 
 def _period_parts(period):
-    """报表数据选择的会计年度（两位）与期间编号；未传值按当前自然月。"""
+    """报表处理选项的世纪、会计年度（两位）与期间编号；未传值按当前自然月。
+
+    四个数字的年份拆成两段：2026 → ("20", "26")，期间编号为月（10）。
+    """
     if period is None or not str(period).strip():
         period = date.today()
     if not isinstance(period, (datetime, date)):
@@ -631,7 +639,7 @@ def _period_parts(period):
                 f"会计期间格式不正确，应为 YYYY-MM 或 YYYY/MM 等可识别格式；当前值：{text}"
             )
         period = date(int(match.group(1)), int(match.group(2)), 1)
-    return period.strftime("%y"), str(period.month)
+    return f"{period.year // 100:02d}", period.strftime("%y"), str(period.month)
 
 
 def download_r55gl1005(in_page, company, destination, period=None, timeout=60000):
@@ -666,7 +674,7 @@ def download_r55gl1005(in_page, company, destination, period=None, timeout=60000
     selection.fill("", timeout=timeout)
     selection.fill(company_value, timeout=timeout)
 
-    fiscal_year, period_number = _period_parts(period)
+    _, fiscal_year, period_number = _period_parts(period)
     logger.info(f"填写会计年度 {fiscal_year}、期间编号 {period_number}")
     for name, value in (("E2", fiscal_year), ("E3", period_number)):
         field = frame.locator(f'input[name="{name}"]')
@@ -700,23 +708,112 @@ def download_r55gl1005(in_page, company, destination, period=None, timeout=60000
 # ---------------------------------------------------------------------------
 # 利润表（R55GZ001 / Profit & Loss (Yearly)）导出
 # ---------------------------------------------------------------------------
-# 页面操作尚未录制，暂不实现自动下载。
-# 录制步骤参考 docs/企业所得税计税-利润表下载步骤.docx：
-#   主页 → 选择页面 → 所有页面 → 总帐 → 中国政府报表 →
-#   批版本处理 - 可用版本 → TKHXLS001（R55GZ001 Profit & Loss (Yearly)）→ 选择 →
-#   处理选项（Century / Fiscal Year / Period Number）→ 确定 →
-#   屏幕(F) → 已提交作业 → 作业 R55GZ001 → 等待完成 → 下载。
-# 录制完成后在此实现，并保持函数签名与返回路径不变。
+# 主页 → 选择页面 → 所有页面 → 总帐 → 中国政府报表（广州…）相关页签 →
+# 利润表 → 版本 TKHXLS001 → 选择所有提取的记录 → 选择 → 数据选择 → 提交(U) →
+# 确定 → 处理选项（Century / Fiscal Year / Period Number）→ 确定 →
+# 屏幕(F) → 已提交作业 → 作业 R55GZ001_TKHXLS001 → 轮询至完成 → 下载。
+
+def _click_tab(frame, names, timeout):
+    """在 #tabBar 中按候选文字点击页签（不同环境页签名带公司前缀）。"""
+    tab_bar = frame.locator("#tabBar")
+    for name in names:
+        tab = tab_bar.get_by_text(name).first
+        try:
+            tab.wait_for(state="visible", timeout=min(timeout, 3000))
+        except PlaywrightTimeoutError:
+            continue
+        tab.click(timeout=timeout)
+        logger.info(f"已切换页签：{name}")
+        return
+    raise PlaywrightTimeoutError(f"#tabBar 中未找到页签：{' / '.join(names)}")
+
+
+def _click_button(frame, timeout, *names):
+    """点击第一个出现的候选按钮；同一按钮在不同表单的快捷键文字可能不同。"""
+    for name in names:
+        button = frame.get_by_role("button", name=name).first
+        try:
+            button.wait_for(state="visible", timeout=min(timeout, 3000))
+        except PlaywrightTimeoutError:
+            continue
+        button.click(timeout=timeout)
+        logger.info(f"已点击按钮：{name}")
+        return
+    raise PlaywrightTimeoutError(f"未找到按钮：{' / '.join(names)}")
+
+
+def _fill_option(frame, name, value, timeout):
+    """填写处理选项编号输入框（E3/E4/E28 等）。"""
+    field = frame.locator(f'input[name="{name}"]')
+    field.wait_for(state="visible", timeout=timeout)
+    field.click(timeout=timeout)
+    field.fill(str(value), timeout=timeout)
+
 
 def download_income_statement(in_page, company, destination, period=None,
                               menu_name=INCOME_STATEMENT_MENU,
                               version=INCOME_STATEMENT_VERSION,
                               job_name=INCOME_STATEMENT_JOB,
-                              century=INCOME_STATEMENT_CENTURY,
                               timeout=60000):
-    """利润表导出页面操作待录制，本函数不执行任何 JDE 操作。"""
-    raise NotImplementedError(
-        "利润表导出页面操作尚未录制；请将 JDE 导出的利润表放到输出目录，"
-        f"或完成录制后补充 web/JDE/jde_function.py 的 download_income_statement。"
+    """返回主页，提交 R55GZ001 利润表并下载生成的文件。"""
+    home = in_page.get_by_title("主页")
+    home.wait_for(state="visible", timeout=timeout)
+    home.click()
+    logger.info("已返回主页，重新选择页面并进入总帐")
+
+    frame = in_page.frame_locator(MENU_IFRAME)
+    _enter_total_ledger(frame, timeout)
+    tab_names = (menu_name,) + tuple(
+        name for name in INCOME_STATEMENT_MENU_CANDIDATES if name != menu_name
     )
+    _click_tab(frame, tab_names, timeout)
+
+    logger.info("打开利润表")
+    _click_menu_link(in_page, "利润表", timeout)
+
+    version_box = frame.get_by_role("textbox", name="版本", exact=True)
+    version_box.wait_for(state="visible", timeout=timeout)
+    version_box.fill(version, timeout=timeout)
+    version_box.press("Enter", timeout=timeout)
+    _click_checkbox(frame, "选择所有提取的记录", timeout)
+    frame.get_by_role("button", name="选择 (Ctrl+Alt+S)").click(timeout=timeout)
+    _click_checkbox(frame, "数据选择", timeout)
+    frame.locator("a").filter(has_text="提交(U)").click(timeout=timeout)
+    _click_button(frame, timeout, "确定 (Ctrl+Alt+O)", "确定 (Ctrl+Alt+0)")
+
+    century, fiscal_year, period_number = _period_parts(period)
+    logger.info(
+        f"填写处理选项：Century {century}、Fiscal Year {fiscal_year}、"
+        f"Period Number {period_number}（公司 {company}）"
+    )
+    for name, value in zip(
+        INCOME_STATEMENT_OPTION_FIELDS, (century, fiscal_year, period_number)
+    ):
+        _fill_option(frame, name, value, timeout)
+
+    _click_button(frame, timeout, "确定 (Ctrl+Alt+O)", "确定 (Ctrl+Alt+0)")
+
+    frame.locator("a").filter(has_text="屏幕(F)").click(timeout=timeout)
+    frame.get_by_role("cell", name="已提交作业", exact=True).click(timeout=timeout)
+
+    submitted_job = f"{job_name}_{version}"
+    job_filter = frame.get_by_role("textbox", name=JOB_FILTER_NAME, exact=True)
+    job_filter.wait_for(state="visible", timeout=timeout)
+    job_filter.fill(submitted_job, timeout=timeout)
+    job_filter.press("Enter", timeout=timeout)
+    # 与 R55GL1005 一致：定时重新查询，等最新一行变为完成后再下载。
+    output_link = _wait_latest_job_completed(
+        frame, timeout, job_name=submitted_job, link_name=submitted_job
+    )
+
+    target = Path(destination)
+    if not target.suffix:
+        target = target.with_suffix(".xls")
+    ensure_dir(target.parent)
+    existing_pages = list(in_page.context.pages)
+    download = _click_and_collect_download(in_page, output_link, timeout)
+    download.save_as(str(target))
+    _close_pages_opened_after(in_page.context, existing_pages)
+    logger.info(f"利润表已导出：{target}")
+    return target
 

@@ -269,7 +269,7 @@ class CITFlow:
         return destination
 
     def export_income_statement(self):
-        """获取本期利润表：从输出目录读取导出表；页面操作待录制时标记待补运行。"""
+        """获取本期利润表：优先读取输出目录中的导出表；没有时从 JDE 导出。"""
         company = self.get("明细账自公司") or self.get("公司")
         if company is None or not str(company).strip():
             raise ConfigError("导出利润表缺少 企业所得税配置.明细账自公司")
@@ -296,7 +296,7 @@ class CITFlow:
             self.context.set("jde_income_statement_path", converted)
             return converted
 
-        # 页面操作尚未录制：调用占位函数，内部不执行任何 JDE 点击。
+        # 输出目录没有导出表：调用 JDE 导出利润表。
         browser = self.context.get_browser("JDE")
         page = browser.get_page() if browser else None
         period, _ = month_bounds(configured_period(self.get("会计期间")))
