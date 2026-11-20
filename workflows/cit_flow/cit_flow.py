@@ -183,40 +183,6 @@ def build_output_path(shared_path, company, period_first, name_template=None):
     return Path(shared_path) / name
 
 
-def find_income_statement(directory, preferred=None):
-    """在输出目录查找利润表导出表。
-
-    JDE 下载文件名通常包含 “利润表” 或 “Profit & Loss”；程序不要求固定文件名，
-    取目录中最新的一个（.xlsx 优先于同时间的 .xls）。
-    """
-    directory = Path(directory)
-    candidates = []
-    if preferred:
-        preferred = Path(preferred)
-        if preferred.is_file() and preferred.stat().st_size > 0:
-            candidates.append(preferred)
-    if directory.is_dir():
-        for path in directory.iterdir():
-            if not path.is_file() or path.name.startswith("~$"):
-                continue
-            if path.suffix.lower() not in (".xlsx", ".xls"):
-                continue
-            if path.stat().st_size == 0:
-                continue
-            name = path.name.lower()
-            if "r55gl1005" in name:
-                continue
-            if ("利润表" in path.name or "profit" in name
-                    or "p&l" in name or "r55gz" in name):
-                candidates.append(path)
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: (
-        path.stat().st_mtime,
-        path.suffix.lower() == ".xlsx",
-    ))
-
-
 class CITFlow:
     """企业所得税单公司流程。"""
 
@@ -269,12 +235,12 @@ class CITFlow:
         return destination
 
     def export_income_statement(self):
-        """获取本期利润表：优先读取输出目录中的导出表；没有时从 JDE 导出。"""
-        company = self.get("明细账自公司") or self.get("公司")
+        """从 JDE 导出本期利润表；每次运行、每行配置都重新导出，不复用历史文件。"""
+        company = self.get("明细账自公司")
         if company is None or not str(company).strip():
             raise ConfigError("导出利润表缺少 企业所得税配置.明细账自公司")
 
-        destination = self.context.get("jde_income_statement_path") or self.get("利润表文件")
+        destination = self.get("利润表文件")
         if destination:
             destination = self._resolve_relative(destination, "input")
         else:
@@ -284,34 +250,18 @@ class CITFlow:
             destination = destination.with_suffix(".xlsx")
         destination.parent.mkdir(parents=True, exist_ok=True)
 
-        candidate = find_income_statement(destination.parent, destination)
-        if candidate is not None:
-            if candidate.suffix.lower() == ".xlsx":
-                logger.info(f"使用输出目录中的利润表导出表：{candidate}")
-                self.context.set("jde_income_statement_path", candidate)
-                return candidate
-            converted = candidate.with_suffix(".xlsx")
-            convert_legacy_excel_to_xlsx(candidate, converted)
-            logger.info(f"利润表导出表已转换为工作簿格式：{converted}")
-            self.context.set("jde_income_statement_path", converted)
-            return converted
-
-        # 输出目录没有导出表：调用 JDE 导出利润表。
         browser = self.context.get_browser("JDE")
         page = browser.get_page() if browser else None
+        if page is None:
+            raise RuntimeError("JDE 浏览器未打开；无法导出利润表")
+
         period, _ = month_bounds(configured_period(self.get("会计期间")))
-        try:
-            raw_path = download_income_statement(
-                page,
-                company=company,
-                destination=destination.with_suffix(".xls"),
-                period=period,
-            )
-        except NotImplementedError as exc:
-            raise PendingModule(
-                "未找到利润表导出表，且页面导出操作尚未录制；"
-                f"请将 JDE 导出的利润表放到输出目录：{destination.parent}"
-            ) from exc
+        raw_path = download_income_statement(
+            page,
+            company=company,
+            destination=destination.with_suffix(".xls"),
+            period=period,
+        )
         convert_legacy_excel_to_xlsx(raw_path, destination)
         logger.info(f"利润表已转换为工作簿格式：{destination}")
         self.context.set("jde_income_statement_path", destination)

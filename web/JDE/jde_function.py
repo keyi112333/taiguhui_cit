@@ -750,6 +750,24 @@ def _fill_option(frame, name, value, timeout):
     field.fill(str(value), timeout=timeout)
 
 
+def _fill_company_literal(frame, company, timeout):
+    """在利润表数据选择中把公司代码作为字面值填入，避免导出其它公司数据。"""
+    code = str(company).strip()
+    if not code:
+        raise RuntimeError("利润表导出缺少公司代码")
+    if code.isdigit():
+        code = code.zfill(5)
+    operand = frame.locator("#RightOperand1")
+    operand.wait_for(state="visible", timeout=timeout)
+    operand.select_option("Literal", timeout=timeout)
+    field = frame.locator("#LITtf")
+    field.click(timeout=timeout)
+    field.click(timeout=timeout)
+    field.fill("", timeout=timeout)
+    field.fill(code, timeout=timeout)
+    logger.info(f"利润表数据选择公司代码：{code}")
+
+
 def download_income_statement(in_page, company, destination, period=None,
                               menu_name=INCOME_STATEMENT_MENU,
                               version=INCOME_STATEMENT_VERSION,
@@ -779,6 +797,7 @@ def download_income_statement(in_page, company, destination, period=None,
     frame.get_by_role("button", name="选择 (Ctrl+Alt+S)").click(timeout=timeout)
     _click_checkbox(frame, "数据选择", timeout)
     frame.locator("a").filter(has_text="提交(U)").click(timeout=timeout)
+    _fill_company_literal(frame, company, timeout)
     _click_button(frame, timeout, "确定 (Ctrl+Alt+O)", "确定 (Ctrl+Alt+0)")
 
     century, fiscal_year, period_number = _period_parts(period)

@@ -28,6 +28,16 @@ from workflows.cit_flow.run_report import (
 
 RUN_SHEET = "登录配置"
 REQUIRED_COLUMNS = ("window凭据", "凭据账号", "共享盘路径")
+# 每行开始前清空的结果类上下文，避免上一行（公司）的数据串到下一行。
+RUN_STATE_KEYS = (
+    "cit_status",
+    "cit_pending_reason",
+    "cit_path",
+    "jde_journal_batch",
+    "jde_journal_rows",
+    "jde_r55gl1005_path",
+    "jde_income_statement_path",
+)
 
 
 class SkipRun(Exception):
@@ -89,8 +99,8 @@ class CITMainTask(TaskBase):
             result, error = "成功", ""
             for key, value in defaults.items():
                 config.set(f"企业所得税配置.{key}", value)
-            self.context.set("cit_status", None)
-            self.context.set("jde_journal_batch", None)
+            for key in RUN_STATE_KEYS:
+                self.context.set(key, None)
             try:
                 info = self.prepare(run)
                 self.run_one(run, info)
