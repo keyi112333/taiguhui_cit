@@ -798,6 +798,8 @@ def download_income_statement(in_page, company, destination, period=None,
     _click_checkbox(frame, "数据选择", timeout)
     frame.locator("a").filter(has_text="提交(U)").click(timeout=timeout)
     _fill_company_literal(frame, company, timeout)
+    # 数据选择后连续两个确定：先确认公司条件，再关闭数据选择提示。
+    _click_button(frame, timeout, "确定 (Ctrl+Alt+O)", "确定 (Ctrl+Alt+0)")
     _click_button(frame, timeout, "确定 (Ctrl+Alt+O)", "确定 (Ctrl+Alt+0)")
 
     century, fiscal_year, period_number = _period_parts(period)
